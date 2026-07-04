@@ -568,7 +568,10 @@ static void wifi_tick(void)
 #define RADAR_CX 206
 #define RADAR_CY 206
 #define RADAR_R  190
-#define RANGE_KM 50.0
+static const int RANGES[] = {10, 25, 50, 100, 200};
+static int range_idx = 2;                 /* default 50km */
+static volatile double g_range_km = 50.0;
+static volatile bool g_refetch = false;
 #define MAX_FLIGHTS 24
 typedef struct { double lat, lon; float track; int alt; char cs[10]; } flight_t;
 static lv_obj_t  *radar_status, *radar_sweep;
@@ -622,7 +625,7 @@ static bool fetch_location(void){
     free(b); return ok;
 }
 static void fetch_flights(void){
-    double dla=RANGE_KM/111.0, dlo=RANGE_KM/(111.0*cos(my_lat*M_PI/180.0));
+    double rk=g_range_km, dla=rk/111.0, dlo=rk/(111.0*cos(my_lat*M_PI/180.0));
     char url[240];
     snprintf(url,sizeof(url),"https://opensky-network.org/api/states/all?lamin=%.4f&lomin=%.4f&lamax=%.4f&lomax=%.4f",
              my_lat-dla,my_lon-dlo,my_lat+dla,my_lon+dlo);
@@ -648,7 +651,7 @@ static void fetch_flights(void){
             g_nfl=cnt;
             xSemaphoreGive(fl_mux);
             g_radar_dirty=true;
-            ESP_LOGI(TAG,"flights=%d (%.0fkm box)",cnt,RANGE_KM);
+            ESP_LOGI(TAG,"flights=%d (%.0fkm box)",cnt,g_range_km);
             cJSON_Delete(r);
         } else ESP_LOGW(TAG,"flights: JSON parse fail (%d bytes)",n);
     } else ESP_LOGW(TAG,"flights: http fail");
@@ -660,9 +663,22 @@ static void radar_task(void *arg){
     ESP_LOGI(TAG,"radar_task: wifi up, locating");
     while(!g_located){ if(!fetch_location()) vTaskDelay(pdMS_TO_TICKS(3000)); }
     ESP_LOGI(TAG,"location %.3f,%.3f (%s)",my_lat,my_lon,loc_city);
-    while(1){ if(wifi_st==W_CONNECTED) fetch_flights(); vTaskDelay(pdMS_TO_TICKS(20000)); }
+    int64_t last=0;
+    while(1){
+        int64_t now=esp_timer_get_time();
+        if(wifi_st==W_CONNECTED && (g_refetch || now-last>20000000LL)){ g_refetch=false; last=now; fetch_flights(); }
+        vTaskDelay(pdMS_TO_TICKS(300));
+    }
 }
 
+static void radar_on_knob(int dir){
+    range_idx += (dir > 0) ? 1 : -1;
+    if (range_idx < 0) range_idx = 0;
+    if (range_idx > (int)(sizeof(RANGES)/sizeof(RANGES[0]))-1) range_idx = (int)(sizeof(RANGES)/sizeof(RANGES[0]))-1;
+    g_range_km = RANGES[range_idx];
+    g_radar_dirty = true;    /* rescale existing blips now */
+    g_refetch = true;        /* pull a box matching the new range */
+}
 static void radar_ring(lv_obj_t *par, int d){
     lv_obj_t *r=lv_obj_create(par); lv_obj_set_size(r,d,d); lv_obj_center(r);
     lv_obj_set_style_radius(r,LV_RADIUS_CIRCLE,0); lv_obj_set_style_bg_opa(r,LV_OPA_TRANSP,0);
@@ -714,9 +730,9 @@ static void radar_tick(void){
         int shown=0;
         for(int i=0;i<g_nfl && shown<MAX_FLIGHTS;i++){
             double d=hav_km(my_lat,my_lon,g_flights[i].lat,g_flights[i].lon);
-            if(d>RANGE_KM) continue;
+            if(d>g_range_km) continue;
             double br=bearing_deg(my_lat,my_lon,g_flights[i].lat,g_flights[i].lon);
-            int rp=(int)((d/RANGE_KM)*RADAR_R);
+            int rp=(int)((d/g_range_km)*RADAR_R);
             int x=RADAR_CX+(int)(rp*sin(br*M_PI/180.0));
             int y=RADAR_CY-(int)(rp*cos(br*M_PI/180.0));
             lv_obj_set_pos(blip_dot[shown],x-3,y-3); lv_obj_clear_flag(blip_dot[shown],LV_OBJ_FLAG_HIDDEN);
@@ -726,7 +742,7 @@ static void radar_tick(void){
         }
         xSemaphoreGive(fl_mux);
         for(int i=shown;i<MAX_FLIGHTS;i++){ lv_obj_add_flag(blip_dot[i],LV_OBJ_FLAG_HIDDEN); lv_obj_add_flag(blip_lbl[i],LV_OBJ_FLAG_HIDDEN); }
-        char b[80]; snprintf(b,sizeof(b),"%s  %d flights  %dkm", loc_city[0]?loc_city:"?", shown, (int)RANGE_KM);
+        char b[80]; snprintf(b,sizeof(b),"%s  %d fl  %dkm (turn=zoom)", loc_city[0]?loc_city:"?", shown, (int)g_range_km);
         lv_label_set_text(radar_status,b);
     } else if(wifi_st!=W_CONNECTED){
         lv_label_set_text(radar_status, wifi_st==W_CONNECTING?"RADAR  connecting wifi...":"RADAR  no wifi (swipe to set up)");
@@ -801,7 +817,7 @@ void app_main(void)
     bsp_lcd_brightness_set(100);
 
     /* register apps (order = tile order) */
-    app_register((app_t){ .name = "Radar", .build = radar_build, .tick = radar_tick });
+    app_register((app_t){ .name = "Radar", .build = radar_build, .tick = radar_tick, .on_knob = radar_on_knob });
     app_register((app_t){ .name = "Timer", .build = timer_build, .tick = timer_tick,
                           .on_knob = timer_on_knob, .on_button = timer_on_button });
     g_wifi_idx = app_register((app_t){ .name = "WiFi", .build = wifi_build, .on_show = wifi_on_show, .tick = wifi_tick });
