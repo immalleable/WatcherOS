@@ -344,13 +344,18 @@ static bool wifi_load(char *ssid, char *pass, size_t cap)
 }
 static void wifi_connect(const char *ssid, const char *pass)
 {
+    esp_wifi_scan_stop();          /* release the driver if a scan is running */
+    scan_busy = false;
     wifi_config_t cfg = { 0 };
     strncpy((char *)cfg.sta.ssid, ssid, sizeof(cfg.sta.ssid) - 1);
     strncpy((char *)cfg.sta.password, pass, sizeof(cfg.sta.password) - 1);
-    cfg.sta.threshold.authmode = (pass && pass[0]) ? WIFI_AUTH_WPA_WPA2_PSK : WIFI_AUTH_OPEN;
+    cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;   /* don't over-filter; use the AP's real auth */
+    cfg.sta.pmf_cfg.capable = true;                /* WPA2/WPA3-transition friendly */
+    cfg.sta.pmf_cfg.required = false;   /* PMF optional (works with WPA2 and WPA3-transition) */
+    cfg.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;       /* enable WPA3-SAE (fixes auth-stage reason=2) */
     strncpy(wifi_ssid, ssid, sizeof(wifi_ssid) - 1);
     have_creds = true; wifi_retry = 0; wifi_st = W_CONNECTING; wifi_ip[0] = 0;
-    ESP_LOGI(TAG, "connecting '%s'", ssid);
+    ESP_LOGI(TAG, "connecting '%s' (pw %d chars)", ssid, (int)strlen(pass));
     esp_wifi_set_config(WIFI_IF_STA, &cfg);
     esp_wifi_disconnect();
     esp_wifi_connect();
@@ -378,7 +383,9 @@ static void wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data)
         } else scan_count = 0;
         scan_busy = false; scan_ready = true;
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        if (have_creds && wifi_retry < 8) { wifi_retry++; wifi_st = W_CONNECTING; esp_wifi_connect(); }
+        wifi_event_sta_disconnected_t *d = (wifi_event_sta_disconnected_t *)data;
+        ESP_LOGW(TAG, "disconnected, reason=%d, retry=%d", d ? d->reason : -1, wifi_retry);
+        if (have_creds && wifi_retry < 30) { wifi_retry++; wifi_st = W_CONNECTING; esp_wifi_connect(); }  /* keep trying ~1min so a sleepy phone hotspot can wake */
         else if (have_creds) { wifi_st = W_FAILED; }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
@@ -415,7 +422,7 @@ static void wifi_init(void)
 }
 
 /* ================= WiFi settings app ================= */
-static lv_obj_t *w_status, *w_list, *w_pwbox, *w_ta, *w_kb, *w_ssid_lbl;
+static lv_obj_t *w_status, *w_list, *w_pwbox, *w_ta, *w_kb, *w_ssid_lbl, *w_note;
 static char      w_sel_ssid[33] = "";
 static int       w_last_shown_scan = -1;
 static int       w_last_st = -1;
@@ -448,6 +455,15 @@ static void wifi_kb_cb(lv_event_t *e)
         wifi_show_password(false);
     }
 }
+static void wifi_ok_cb(lv_event_t *e)     /* connect with typed password */
+{
+    const char *pw = lv_textarea_get_text(w_ta);
+    wifi_save(w_sel_ssid, pw);
+    wifi_connect(w_sel_ssid, pw);
+    wifi_show_password(false);
+}
+static void wifi_cancel_cb(lv_event_t *e) { wifi_show_password(false); }   /* back to list */
+static void wifi_qr_cb(lv_event_t *e)     { lv_label_set_text(w_note, LV_SYMBOL_IMAGE "  QR scan: coming next"); }
 static void wifi_build(lv_obj_t *tile)
 {
     lv_obj_set_style_bg_color(tile, lv_color_hex(0x0a0a12), 0);
@@ -479,10 +495,36 @@ static void wifi_build(lv_obj_t *tile)
     lv_obj_align(w_ssid_lbl, LV_ALIGN_TOP_MID, 0, 40);
     w_ta = lv_textarea_create(w_pwbox);
     lv_textarea_set_one_line(w_ta, true);
-    lv_textarea_set_password_mode(w_ta, true);
+    lv_textarea_set_password_mode(w_ta, false);   /* visible: easier to type right */
     lv_textarea_set_placeholder_text(w_ta, "password");
     lv_obj_set_width(w_ta, 300);
     lv_obj_align(w_ta, LV_ALIGN_TOP_MID, 0, 70);
+    /* action row below password: OK | Cancel | Scan QR */
+    lv_obj_t *w_row = lv_obj_create(w_pwbox);
+    lv_obj_remove_style_all(w_row);
+    lv_obj_set_size(w_row, 384, 48);
+    lv_obj_align(w_row, LV_ALIGN_TOP_MID, 0, 104);
+    lv_obj_set_flex_flow(w_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(w_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(w_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *bl;
+    lv_obj_t *b_ok = lv_btn_create(w_row);
+    lv_obj_set_style_bg_color(b_ok, lv_color_hex(0x1f7a33), 0);
+    bl = lv_label_create(b_ok); lv_label_set_text(bl, LV_SYMBOL_OK " OK");
+    lv_obj_add_event_cb(b_ok, wifi_ok_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *b_ca = lv_btn_create(w_row);
+    lv_obj_set_style_bg_color(b_ca, lv_color_hex(0x5a1f1f), 0);
+    bl = lv_label_create(b_ca); lv_label_set_text(bl, LV_SYMBOL_CLOSE " Cancel");
+    lv_obj_add_event_cb(b_ca, wifi_cancel_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *b_qr = lv_btn_create(w_row);
+    lv_obj_set_style_bg_color(b_qr, lv_color_hex(0x3a2f5a), 0);
+    bl = lv_label_create(b_qr); lv_label_set_text(bl, LV_SYMBOL_IMAGE " QR");
+    lv_obj_add_event_cb(b_qr, wifi_qr_cb, LV_EVENT_CLICKED, NULL);
+    w_note = lv_label_create(w_pwbox);
+    lv_label_set_text(w_note, "");
+    lv_obj_set_style_text_color(w_note, lv_color_hex(0x7a8699), 0);
+    lv_obj_set_style_text_font(w_note, &lv_font_montserrat_16, 0);
+    lv_obj_align(w_note, LV_ALIGN_TOP_MID, 0, 158);
     w_kb = lv_keyboard_create(w_pwbox);
     lv_keyboard_set_textarea(w_kb, w_ta);
     lv_obj_add_event_cb(w_kb, wifi_kb_cb, LV_EVENT_READY, NULL);
