@@ -144,16 +144,32 @@ static void snd(int cue) { if (snd_q) xQueueSend(snd_q, &cue, 0); }
 
 static void fx_task(void *arg)
 {
-    /* Audio is intentionally NOT initialized: the always-on I2S codec starves
-     * the WiFi radio on this board (auth handshake fails), and the BSP has no
-     * way to release I2S while keeping WiFi. So feedback is visual (LED +
-     * on-screen). Revisit audio later as a WiFi-coexisting feature. */
+    /* Factory-firmware technique: init the codec once, but keep I2S DISABLED
+     * when idle (bsp_codec_dev_stop -> i2s_channel_disable) so its DMA/ISR
+     * doesn't starve the WiFi radio. Resume only for the brief moment a
+     * sound plays, then stop again. Buffers live in PSRAM (sdkconfig). */
+    bsp_codec_init();
+    bsp_codec_volume_set(80, NULL);
+    bsp_codec_dev_stop();               /* I2S off until a sound is needed */
     int flash = 0;
     while (1) {
         int cue;
-        xQueueReceive(snd_q, &cue, pdMS_TO_TICKS(50));   /* drain cues, no playback */
-        if (led_flash) { flash ^= 1; bsp_rgb_set(flash ? 60 : 0, 0, 0); }  /* alarm only */
-        else bsp_rgb_set(0, 0, 0);   /* LED off during normal use */
+        if (xQueueReceive(snd_q, &cue, pdMS_TO_TICKS(50)) == pdTRUE) {
+            bsp_codec_dev_resume();     /* enable I2S just for playback */
+            do {
+                switch (cue) {
+                    case SND_NAV:     play_tone(900, 40, 7000); break;
+                    case SND_TICK_UP: play_tone(1200, 26, 6000); break;
+                    case SND_TICK_DN: play_tone(800, 26, 6000); break;
+                    case SND_START:   play_tone(880, 90, 9000); play_tone(1320, 120, 9000); break;
+                    case SND_CANCEL:  play_tone(600, 90, 8000); break;
+                    case SND_ALARM:   play_tone(1200, 120, 12000); play_tone(1600, 140, 12000); break;
+                }
+            } while (xQueueReceive(snd_q, &cue, 0) == pdTRUE);
+            bsp_codec_dev_stop();       /* I2S off again -> WiFi unaffected */
+        }
+        if (led_flash) { flash ^= 1; bsp_rgb_set(flash ? 60 : 0, 0, 0); }
+        else bsp_rgb_set(0, 0, 0);
     }
 }
 
@@ -800,6 +816,11 @@ static void ui_tick(lv_timer_t *t)
             lv_obj_set_tile(tileview, TILES[g_timer_idx], LV_ANIM_ON);   /* jump to TIME! screen */
     }
     led_flash = (t_state == T_DONE);   /* LED blinks whenever the timer is ringing */
+    if (t_state == T_DONE) {
+        static int64_t last_beep = 0;
+        int64_t nb = esp_timer_get_time();
+        if (nb - last_beep > 1600000LL) { last_beep = nb; snd(SND_ALARM); }
+    }
 }
 
 static void ui_build(void)
