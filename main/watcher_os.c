@@ -735,7 +735,7 @@ static void radar_task(void *arg){
     int64_t last=0;
     while(1){
         int64_t now=esp_timer_get_time();
-        if(wifi_st==W_CONNECTED && !g_screen_dim && (g_refetch || last==0 || now-last>60000000LL)){ g_refetch=false; last=now; fetch_flights(); }
+        if(wifi_st==W_CONNECTED && !g_screen_dim && (g_refetch || last==0 || now-last>15000000LL)){ g_refetch=false; last=now; fetch_flights(); }  /* 15s: matches OpenSky data cadence; paused while screen off */
         vTaskDelay(pdMS_TO_TICKS(300));
     }
 }
