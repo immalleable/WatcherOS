@@ -35,6 +35,9 @@
 #include "esp_lvgl_port.h"
 #include "iot_knob.h"
 #include "iot_button.h"
+#include "esp_http_client.h"
+#include "esp_crt_bundle.h"
+#include "cJSON.h"
 
 static const char *TAG = "WATCHER_OS";
 
@@ -561,6 +564,177 @@ static void wifi_tick(void)
     }
 }
 
+/* ================= Radar app (nearby flights) ================= */
+#define RADAR_CX 206
+#define RADAR_CY 206
+#define RADAR_R  190
+#define RANGE_KM 50.0
+#define MAX_FLIGHTS 24
+typedef struct { double lat, lon; float track; int alt; char cs[10]; } flight_t;
+static lv_obj_t  *radar_status, *radar_sweep;
+static lv_point_t sweep_pts[2];
+static float      sweep_ang = 0.0f;
+static lv_obj_t  *blip_dot[MAX_FLIGHTS], *blip_lbl[MAX_FLIGHTS];
+static flight_t   g_flights[MAX_FLIGHTS];
+static volatile int g_nfl = 0;
+static volatile bool g_radar_dirty = false;
+static double     my_lat = 0, my_lon = 0;
+static volatile bool g_located = false;
+static char       loc_city[24] = "";
+static SemaphoreHandle_t fl_mux;
+
+static double hav_km(double la1,double lo1,double la2,double lo2){
+    double R=6371.0, dla=(la2-la1)*M_PI/180.0, dlo=(lo2-lo1)*M_PI/180.0;
+    double a=sin(dla/2)*sin(dla/2)+cos(la1*M_PI/180)*cos(la2*M_PI/180)*sin(dlo/2)*sin(dlo/2);
+    return R*2*atan2(sqrt(a),sqrt(1-a));
+}
+static double bearing_deg(double la1,double lo1,double la2,double lo2){
+    double p1=la1*M_PI/180,p2=la2*M_PI/180,dl=(lo2-lo1)*M_PI/180;
+    double y=sin(dl)*cos(p2), x=cos(p1)*sin(p2)-sin(p1)*cos(p2)*cos(dl);
+    double b=atan2(y,x)*180.0/M_PI; if(b<0)b+=360; return b;
+}
+
+/* ---- HTTP ---- */
+static int http_get(const char *url, char *out, int cap, bool tls){
+    esp_http_client_config_t cfg = { .url=url, .timeout_ms=9000, .crt_bundle_attach = tls?esp_crt_bundle_attach:NULL };
+    esp_http_client_handle_t h=esp_http_client_init(&cfg);
+    int off=-1;
+    if(esp_http_client_open(h,0)==ESP_OK){
+        esp_http_client_fetch_headers(h);
+        off=0; int n;
+        while((n=esp_http_client_read(h,out+off,cap-1-off))>0){ off+=n; if(off>=cap-1) break; }
+        out[off>0?off:0]=0;
+        esp_http_client_close(h);
+    }
+    esp_http_client_cleanup(h);
+    return off;
+}
+static bool fetch_location(void){
+    char *b=malloc(1024); if(!b) return false; bool ok=false;
+    int n=http_get("http://ip-api.com/json/?fields=status,lat,lon,city",b,1024,false);
+    ESP_LOGI(TAG,"iploc http=%d: %.90s",n,n>0?b:"(none)");
+    if(n>0){ cJSON *r=cJSON_Parse(b);
+        if(r){ cJSON *la=cJSON_GetObjectItem(r,"lat"),*lo=cJSON_GetObjectItem(r,"lon"),*ci=cJSON_GetObjectItem(r,"city");
+            if(cJSON_IsNumber(la)&&cJSON_IsNumber(lo)){ my_lat=la->valuedouble; my_lon=lo->valuedouble;
+                if(cJSON_IsString(ci)) strncpy(loc_city,ci->valuestring,sizeof(loc_city)-1);
+                g_located=true; ok=true; }
+            cJSON_Delete(r); } }
+    free(b); return ok;
+}
+static void fetch_flights(void){
+    double dla=RANGE_KM/111.0, dlo=RANGE_KM/(111.0*cos(my_lat*M_PI/180.0));
+    char url[240];
+    snprintf(url,sizeof(url),"https://opensky-network.org/api/states/all?lamin=%.4f&lomin=%.4f&lamax=%.4f&lomax=%.4f",
+             my_lat-dla,my_lon-dlo,my_lat+dla,my_lon+dlo);
+    int cap=64*1024; char *b=heap_caps_malloc(cap,MALLOC_CAP_SPIRAM); if(!b)b=malloc(cap); if(!b)return;
+    int n=http_get(url,b,cap,true);
+    if(n>0){ cJSON *r=cJSON_Parse(b);
+        if(r){ cJSON *states=cJSON_GetObjectItem(r,"states");
+            flight_t tmp[MAX_FLIGHTS]; int cnt=0;
+            if(cJSON_IsArray(states)){ cJSON *st;
+                cJSON_ArrayForEach(st,states){ if(cnt>=MAX_FLIGHTS)break; if(!cJSON_IsArray(st))continue;
+                    cJSON *lo=cJSON_GetArrayItem(st,5),*la=cJSON_GetArrayItem(st,6),*cs=cJSON_GetArrayItem(st,1),
+                          *tr=cJSON_GetArrayItem(st,10),*al=cJSON_GetArrayItem(st,7);
+                    if(!cJSON_IsNumber(lo)||!cJSON_IsNumber(la))continue;
+                    tmp[cnt].lat=la->valuedouble; tmp[cnt].lon=lo->valuedouble;
+                    tmp[cnt].track=cJSON_IsNumber(tr)?tr->valuedouble:0;
+                    tmp[cnt].alt=cJSON_IsNumber(al)?(int)al->valuedouble:0;
+                    tmp[cnt].cs[0]=0;
+                    if(cJSON_IsString(cs)){ int j=0; for(char *p=cs->valuestring;*p&&j<9;p++) if(*p!=' ') tmp[cnt].cs[j++]=*p; tmp[cnt].cs[j]=0; }
+                    cnt++; }
+            }
+            xSemaphoreTake(fl_mux,portMAX_DELAY);
+            for(int i=0;i<cnt;i++) g_flights[i]=tmp[i];
+            g_nfl=cnt;
+            xSemaphoreGive(fl_mux);
+            g_radar_dirty=true;
+            ESP_LOGI(TAG,"flights=%d (%.0fkm box)",cnt,RANGE_KM);
+            cJSON_Delete(r);
+        } else ESP_LOGW(TAG,"flights: JSON parse fail (%d bytes)",n);
+    } else ESP_LOGW(TAG,"flights: http fail");
+    free(b);
+}
+static void radar_task(void *arg){
+    ESP_LOGI(TAG,"radar_task started");
+    while(wifi_st!=W_CONNECTED) vTaskDelay(pdMS_TO_TICKS(500));
+    ESP_LOGI(TAG,"radar_task: wifi up, locating");
+    while(!g_located){ if(!fetch_location()) vTaskDelay(pdMS_TO_TICKS(3000)); }
+    ESP_LOGI(TAG,"location %.3f,%.3f (%s)",my_lat,my_lon,loc_city);
+    while(1){ if(wifi_st==W_CONNECTED) fetch_flights(); vTaskDelay(pdMS_TO_TICKS(20000)); }
+}
+
+static void radar_ring(lv_obj_t *par, int d){
+    lv_obj_t *r=lv_obj_create(par); lv_obj_set_size(r,d,d); lv_obj_center(r);
+    lv_obj_set_style_radius(r,LV_RADIUS_CIRCLE,0); lv_obj_set_style_bg_opa(r,LV_OPA_TRANSP,0);
+    lv_obj_set_style_border_color(r,lv_color_hex(0x1f6b2f),0); lv_obj_set_style_border_width(r,2,0);
+    lv_obj_clear_flag(r,LV_OBJ_FLAG_CLICKABLE); lv_obj_clear_flag(r,LV_OBJ_FLAG_SCROLLABLE);
+}
+static void radar_build(lv_obj_t *tile){
+    lv_obj_set_style_bg_color(tile,lv_color_hex(0x02160a),0);
+    radar_ring(tile,380); radar_ring(tile,260); radar_ring(tile,140);
+    lv_obj_t *c=lv_obj_create(tile); lv_obj_set_size(c,8,8); lv_obj_center(c);
+    lv_obj_set_style_radius(c,LV_RADIUS_CIRCLE,0); lv_obj_set_style_bg_color(c,lv_color_hex(0x8ce63a),0);
+    lv_obj_set_style_border_width(c,0,0); lv_obj_clear_flag(c,LV_OBJ_FLAG_CLICKABLE);
+    radar_sweep=lv_line_create(tile);
+    static lv_style_t sst; lv_style_init(&sst);
+    lv_style_set_line_color(&sst,lv_color_hex(0x39ff6a)); lv_style_set_line_width(&sst,3);
+    lv_obj_add_style(radar_sweep,&sst,0);
+    sweep_pts[0].x=RADAR_CX; sweep_pts[0].y=RADAR_CY; sweep_pts[1].x=RADAR_CX; sweep_pts[1].y=RADAR_CY-RADAR_R;
+    lv_line_set_points(radar_sweep,sweep_pts,2);
+    /* blip pool */
+    for(int i=0;i<MAX_FLIGHTS;i++){
+        blip_dot[i]=lv_obj_create(tile); lv_obj_set_size(blip_dot[i],7,7);
+        lv_obj_set_style_radius(blip_dot[i],LV_RADIUS_CIRCLE,0);
+        lv_obj_set_style_bg_color(blip_dot[i],lv_color_hex(0xffee55),0);
+        lv_obj_set_style_border_width(blip_dot[i],0,0);
+        lv_obj_clear_flag(blip_dot[i],LV_OBJ_FLAG_CLICKABLE|LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(blip_dot[i],LV_OBJ_FLAG_HIDDEN);
+        blip_lbl[i]=lv_label_create(tile);
+        lv_obj_set_style_text_color(blip_lbl[i],lv_color_hex(0xcfeecf),0);
+        lv_obj_set_style_text_font(blip_lbl[i],&lv_font_montserrat_16,0);
+        lv_obj_add_flag(blip_lbl[i],LV_OBJ_FLAG_HIDDEN);
+    }
+    radar_status=lv_label_create(tile);
+    lv_label_set_text(radar_status,"RADAR  connecting...");
+    lv_obj_set_style_text_color(radar_status,lv_color_hex(0x8ce63a),0);
+    lv_obj_set_style_text_font(radar_status,&lv_font_montserrat_16,0);
+    lv_obj_set_style_bg_color(radar_status,lv_color_black(),0); lv_obj_set_style_bg_opa(radar_status,LV_OPA_50,0);
+    lv_obj_set_style_pad_all(radar_status,3,0); lv_obj_align(radar_status,LV_ALIGN_BOTTOM_MID,0,-6);
+}
+static void radar_tick(void){
+    led_flash=false; led_r=0; led_g=18; led_b=6;
+    sweep_ang+=0.12f; if(sweep_ang>6.2832f) sweep_ang-=6.2832f;
+    sweep_pts[1].x=RADAR_CX+(int)(RADAR_R*sinf(sweep_ang));
+    sweep_pts[1].y=RADAR_CY-(int)(RADAR_R*cosf(sweep_ang));
+    lv_line_set_points(radar_sweep,sweep_pts,2);
+
+    if(g_radar_dirty){
+        g_radar_dirty=false;
+        xSemaphoreTake(fl_mux,portMAX_DELAY);
+        int shown=0;
+        for(int i=0;i<g_nfl && shown<MAX_FLIGHTS;i++){
+            double d=hav_km(my_lat,my_lon,g_flights[i].lat,g_flights[i].lon);
+            if(d>RANGE_KM) continue;
+            double br=bearing_deg(my_lat,my_lon,g_flights[i].lat,g_flights[i].lon);
+            int rp=(int)((d/RANGE_KM)*RADAR_R);
+            int x=RADAR_CX+(int)(rp*sin(br*M_PI/180.0));
+            int y=RADAR_CY-(int)(rp*cos(br*M_PI/180.0));
+            lv_obj_set_pos(blip_dot[shown],x-3,y-3); lv_obj_clear_flag(blip_dot[shown],LV_OBJ_FLAG_HIDDEN);
+            lv_label_set_text(blip_lbl[shown],g_flights[i].cs);
+            lv_obj_set_pos(blip_lbl[shown],x+5,y-8); lv_obj_clear_flag(blip_lbl[shown],LV_OBJ_FLAG_HIDDEN);
+            shown++;
+        }
+        xSemaphoreGive(fl_mux);
+        for(int i=shown;i<MAX_FLIGHTS;i++){ lv_obj_add_flag(blip_dot[i],LV_OBJ_FLAG_HIDDEN); lv_obj_add_flag(blip_lbl[i],LV_OBJ_FLAG_HIDDEN); }
+        char b[80]; snprintf(b,sizeof(b),"%s  %d flights  %dkm", loc_city[0]?loc_city:"?", shown, (int)RANGE_KM);
+        lv_label_set_text(radar_status,b);
+    } else if(wifi_st!=W_CONNECTED){
+        lv_label_set_text(radar_status, wifi_st==W_CONNECTING?"RADAR  connecting wifi...":"RADAR  no wifi (swipe to set up)");
+    } else if(!g_located){
+        lv_label_set_text(radar_status,"RADAR  locating...");
+    }
+}
+
 /* ================= navigation + tick ================= */
 static void tv_changed_cb(lv_event_t *e)
 {
@@ -617,8 +791,8 @@ void app_main(void)
      * (48 lines, double) keep it small enough to fit internal RAM. */
     bsp_display_cfg_t dcfg = {
         .lvgl_port_cfg = ESP_LVGL_PORT_INIT_CONFIG(),
-        .buffer_size = 412 * 48,
-        .double_buffer = true,
+        .buffer_size = 412 * 20,          /* smaller internal buffer: frees RAM for WiFi/TLS + tasks */
+        .double_buffer = false,
         .flags = { .buff_dma = true, .buff_spiram = false },
     };
     dcfg.lvgl_port_cfg.task_affinity = 1;   /* pin LVGL to core 1; leave core 0 for WiFi (auth handshake is timing-critical) */
@@ -627,7 +801,7 @@ void app_main(void)
     bsp_lcd_brightness_set(100);
 
     /* register apps (order = tile order) */
-    app_register((app_t){ .name = "Home",  .build = home_build,  .tick = home_tick });
+    app_register((app_t){ .name = "Radar", .build = radar_build, .tick = radar_tick });
     app_register((app_t){ .name = "Timer", .build = timer_build, .tick = timer_tick,
                           .on_knob = timer_on_knob, .on_button = timer_on_button });
     g_wifi_idx = app_register((app_t){ .name = "WiFi", .build = wifi_build, .on_show = wifi_on_show, .tick = wifi_tick });
@@ -640,8 +814,11 @@ void app_main(void)
 
     snd_q = xQueueCreate(8, sizeof(int));
     xTaskCreatePinnedToCore(fx_task, "fx", 4096, NULL, 5, NULL, 1);
+    fl_mux = xSemaphoreCreateMutex();
     wifi_init();
     input_init();
+    BaseType_t rc = xTaskCreate(radar_task, "radar", 8192, NULL, 4, NULL);
+    ESP_LOGI(TAG, "radar task create rc=%d free_internal=%d", (int)rc, (int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 
     ESP_LOGI(TAG, "watcher_os running: %d apps (Home, Timer, WiFi). swipe to navigate.", n_apps);
     /* nothing else here — the LVGL task + fx_task + input drive everything */
