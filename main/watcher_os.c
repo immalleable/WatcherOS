@@ -568,9 +568,9 @@ static void wifi_tick(void)
 #define RADAR_CX 206
 #define RADAR_CY 206
 #define RADAR_R  190
-static const int RANGES[] = {10, 25, 50, 100, 200};
-static int range_idx = 2;                 /* default 50km */
-static volatile double g_range_km = 50.0;
+static const int RANGES[] = {10, 20, 50, 100, 200};
+static int range_idx = 1;                 /* default 20km */
+static volatile double g_range_km = 20.0;
 static volatile bool g_refetch = false;
 #define MAX_FLIGHTS 24
 typedef struct { double lat, lon; float track; int alt; char cs[10]; } flight_t;
