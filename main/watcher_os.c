@@ -151,8 +151,8 @@ static void fx_task(void *arg)
     while (1) {
         int cue;
         xQueueReceive(snd_q, &cue, pdMS_TO_TICKS(50));   /* drain cues, no playback */
-        if (led_flash) { flash ^= 1; bsp_rgb_set(flash ? 60 : 0, 0, 0); }
-        else bsp_rgb_set(led_r, led_g, led_b);
+        if (led_flash) { flash ^= 1; bsp_rgb_set(flash ? 60 : 0, 0, 0); }  /* alarm only */
+        else bsp_rgb_set(0, 0, 0);   /* LED off during normal use */
     }
 }
 
@@ -585,6 +585,8 @@ static double     my_lat = 0, my_lon = 0;
 static volatile bool g_located = false;
 static char       loc_city[24] = "";
 static SemaphoreHandle_t fl_mux;
+static int g_http_status = 0;
+static volatile int64_t g_last_ok_us = 0;
 
 static double hav_km(double la1,double lo1,double la2,double lo2){
     double R=6371.0, dla=(la2-la1)*M_PI/180.0, dlo=(lo2-lo1)*M_PI/180.0;
@@ -604,6 +606,7 @@ static int http_get(const char *url, char *out, int cap, bool tls){
     int off=-1;
     if(esp_http_client_open(h,0)==ESP_OK){
         esp_http_client_fetch_headers(h);
+        g_http_status = esp_http_client_get_status_code(h);
         off=0; int n;
         while((n=esp_http_client_read(h,out+off,cap-1-off))>0){ off+=n; if(off>=cap-1) break; }
         out[off>0?off:0]=0;
@@ -630,8 +633,9 @@ static void fetch_flights(void){
     snprintf(url,sizeof(url),"https://opensky-network.org/api/states/all?lamin=%.4f&lomin=%.4f&lamax=%.4f&lomax=%.4f",
              my_lat-dla,my_lon-dlo,my_lat+dla,my_lon+dlo);
     int cap=64*1024; char *b=heap_caps_malloc(cap,MALLOC_CAP_SPIRAM); if(!b)b=malloc(cap); if(!b)return;
+    g_http_status=0;
     int n=http_get(url,b,cap,true);
-    if(n>0){ cJSON *r=cJSON_Parse(b);
+    if(n>0 && g_http_status==200){ cJSON *r=cJSON_Parse(b);
         if(r){ cJSON *states=cJSON_GetObjectItem(r,"states");
             flight_t tmp[MAX_FLIGHTS]; int cnt=0;
             if(cJSON_IsArray(states)){ cJSON *st;
@@ -650,11 +654,12 @@ static void fetch_flights(void){
             for(int i=0;i<cnt;i++) g_flights[i]=tmp[i];
             g_nfl=cnt;
             xSemaphoreGive(fl_mux);
+            g_last_ok_us = esp_timer_get_time();
             g_radar_dirty=true;
             ESP_LOGI(TAG,"flights=%d (%.0fkm box)",cnt,g_range_km);
             cJSON_Delete(r);
-        } else ESP_LOGW(TAG,"flights: JSON parse fail (%d bytes)",n);
-    } else ESP_LOGW(TAG,"flights: http fail");
+        } else { ESP_LOGW(TAG,"flights: parse fail status=%d",g_http_status); g_radar_dirty=true; }
+    } else { ESP_LOGW(TAG,"flights: http n=%d status=%d (rate-limited?)",n,g_http_status); g_radar_dirty=true; }
     free(b);
 }
 static void radar_task(void *arg){
@@ -666,7 +671,7 @@ static void radar_task(void *arg){
     int64_t last=0;
     while(1){
         int64_t now=esp_timer_get_time();
-        if(wifi_st==W_CONNECTED && (g_refetch || now-last>20000000LL)){ g_refetch=false; last=now; fetch_flights(); }
+        if(wifi_st==W_CONNECTED && (g_refetch || last==0 || now-last>60000000LL)){ g_refetch=false; last=now; fetch_flights(); }
         vTaskDelay(pdMS_TO_TICKS(300));
     }
 }
@@ -724,8 +729,11 @@ static void radar_tick(void){
     sweep_pts[1].y=RADAR_CY-(int)(RADAR_R*cosf(sweep_ang));
     lv_line_set_points(radar_sweep,sweep_pts,2);
 
+    int64_t now_t = esp_timer_get_time();
+    bool stale = (g_last_ok_us == 0) || (now_t - g_last_ok_us > 90000000LL);
     if(g_radar_dirty){
         g_radar_dirty=false;
+        lv_color_t bc = stale ? lv_color_hex(0x557755) : lv_color_hex(0xffee55);   /* dim when stale */
         xSemaphoreTake(fl_mux,portMAX_DELAY);
         int shown=0;
         for(int i=0;i<g_nfl && shown<MAX_FLIGHTS;i++){
@@ -735,6 +743,7 @@ static void radar_tick(void){
             int rp=(int)((d/g_range_km)*RADAR_R);
             int x=RADAR_CX+(int)(rp*sin(br*M_PI/180.0));
             int y=RADAR_CY-(int)(rp*cos(br*M_PI/180.0));
+            lv_obj_set_style_bg_color(blip_dot[shown],bc,0);
             lv_obj_set_pos(blip_dot[shown],x-3,y-3); lv_obj_clear_flag(blip_dot[shown],LV_OBJ_FLAG_HIDDEN);
             lv_label_set_text(blip_lbl[shown],g_flights[i].cs);
             lv_obj_set_pos(blip_lbl[shown],x+5,y-8); lv_obj_clear_flag(blip_lbl[shown],LV_OBJ_FLAG_HIDDEN);
@@ -742,7 +751,13 @@ static void radar_tick(void){
         }
         xSemaphoreGive(fl_mux);
         for(int i=shown;i<MAX_FLIGHTS;i++){ lv_obj_add_flag(blip_dot[i],LV_OBJ_FLAG_HIDDEN); lv_obj_add_flag(blip_lbl[i],LV_OBJ_FLAG_HIDDEN); }
-        char b[80]; snprintf(b,sizeof(b),"%s  %d fl  %dkm (turn=zoom)", loc_city[0]?loc_city:"?", shown, (int)g_range_km);
+    }
+    /* status refreshes every tick so the STALE age stays live */
+    if(wifi_st==W_CONNECTED && g_located){
+        char b[96];
+        if(g_last_ok_us==0) snprintf(b,sizeof(b),"%s  waiting for flights  %dkm", loc_city[0]?loc_city:"?", (int)g_range_km);
+        else if(stale)      snprintf(b,sizeof(b),"%s  STALE %ds  %dkm (turn=zoom)", loc_city[0]?loc_city:"?", (int)((now_t-g_last_ok_us)/1000000LL), (int)g_range_km);
+        else                snprintf(b,sizeof(b),"%s  %d fl  %dkm (turn=zoom)", loc_city[0]?loc_city:"?", g_nfl, (int)g_range_km);
         lv_label_set_text(radar_status,b);
     } else if(wifi_st!=W_CONNECTED){
         lv_label_set_text(radar_status, wifi_st==W_CONNECTING?"RADAR  connecting wifi...":"RADAR  no wifi (swipe to set up)");
