@@ -140,22 +140,14 @@ static void snd(int cue) { if (snd_q) xQueueSend(snd_q, &cue, 0); }
 
 static void fx_task(void *arg)
 {
-    bsp_codec_init();
-    bsp_codec_volume_set(75, NULL);
-    bsp_codec_set_fs(SR, 16, 1);
+    /* Audio is intentionally NOT initialized: the always-on I2S codec starves
+     * the WiFi radio on this board (auth handshake fails), and the BSP has no
+     * way to release I2S while keeping WiFi. So feedback is visual (LED +
+     * on-screen). Revisit audio later as a WiFi-coexisting feature. */
     int flash = 0;
     while (1) {
         int cue;
-        if (xQueueReceive(snd_q, &cue, pdMS_TO_TICKS(50)) == pdTRUE) {
-            switch (cue) {
-                case SND_NAV:     play_tone(900, 40, 7000); break;
-                case SND_TICK_UP: play_tone(1200, 26, 6000); break;
-                case SND_TICK_DN: play_tone(800, 26, 6000); break;
-                case SND_START:   play_tone(880, 90, 9000); play_tone(1320, 120, 9000); break;
-                case SND_CANCEL:  play_tone(600, 90, 8000); break;
-                case SND_ALARM:   play_tone(1200, 110, 12000); play_tone(1600, 110, 12000); break;
-            }
-        }
+        xQueueReceive(snd_q, &cue, pdMS_TO_TICKS(50));   /* drain cues, no playback */
         if (led_flash) { flash ^= 1; bsp_rgb_set(flash ? 60 : 0, 0, 0); }
         else bsp_rgb_set(led_r, led_g, led_b);
     }
@@ -629,6 +621,7 @@ void app_main(void)
         .double_buffer = true,
         .flags = { .buff_dma = true, .buff_spiram = false },
     };
+    dcfg.lvgl_port_cfg.task_affinity = 1;   /* pin LVGL to core 1; leave core 0 for WiFi (auth handshake is timing-critical) */
     lv_disp_t *disp = bsp_lvgl_init_with_cfg(&dcfg);
     assert(disp != NULL);
     bsp_lcd_brightness_set(100);
@@ -646,7 +639,7 @@ void app_main(void)
     }
 
     snd_q = xQueueCreate(8, sizeof(int));
-    xTaskCreate(fx_task, "fx", 4096, NULL, 5, NULL);
+    xTaskCreatePinnedToCore(fx_task, "fx", 4096, NULL, 5, NULL, 1);
     wifi_init();
     input_init();
 
