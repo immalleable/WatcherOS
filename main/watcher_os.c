@@ -38,6 +38,7 @@
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
 #include "cJSON.h"
+#include "secrets.h"
 
 static const char *TAG = "WATCHER_OS";
 
@@ -636,6 +637,28 @@ static int http_get(const char *url, char *out, int cap, bool tls){
     esp_http_client_cleanup(h);
     return off;
 }
+/* GET or POST with optional bearer token (always TLS via cert bundle) */
+static int http_req(const char *url, const char *post_body, const char *bearer, char *out, int cap){
+    esp_http_client_config_t cfg = { .url=url, .timeout_ms=9000, .crt_bundle_attach=esp_crt_bundle_attach,
+                                     .buffer_size=2048, .buffer_size_tx=2560 };  /* big bearer token needs a large TX buffer */
+    esp_http_client_handle_t h=esp_http_client_init(&cfg);
+    int off=-1;
+    if(post_body){ esp_http_client_set_method(h, HTTP_METHOD_POST); esp_http_client_set_header(h,"Content-Type","application/x-www-form-urlencoded"); }
+    char hdr[1700];
+    if(bearer){ snprintf(hdr,sizeof(hdr),"Bearer %s",bearer); esp_http_client_set_header(h,"Authorization",hdr); }
+    int wlen = post_body?strlen(post_body):0;
+    if(esp_http_client_open(h,wlen)==ESP_OK){
+        if(wlen>0) esp_http_client_write(h,post_body,wlen);
+        esp_http_client_fetch_headers(h);
+        g_http_status=esp_http_client_get_status_code(h);
+        off=0; int n;
+        while((n=esp_http_client_read(h,out+off,cap-1-off))>0){ off+=n; if(off>=cap-1) break; }
+        out[off>0?off:0]=0;
+        esp_http_client_close(h);
+    }
+    esp_http_client_cleanup(h);
+    return off;
+}
 static bool fetch_location(void){
     char *b=malloc(1024); if(!b) return false; bool ok=false;
     int n=http_get("http://ip-api.com/json/?fields=status,lat,lon,city",b,1024,false);
@@ -648,14 +671,34 @@ static bool fetch_location(void){
             cJSON_Delete(r); } }
     free(b); return ok;
 }
+static char g_token[1536] = "";
+static int64_t g_token_exp_us = 0;
+static bool opensky_token(void){
+    char body[192];
+    snprintf(body,sizeof(body),"grant_type=client_credentials&client_id=%s&client_secret=%s",OPENSKY_CLIENT_ID,OPENSKY_CLIENT_SECRET);
+    int cap=4096; char *buf=heap_caps_malloc(cap,MALLOC_CAP_SPIRAM); if(!buf) buf=malloc(cap); if(!buf) return false;
+    g_http_status=0;
+    int n=http_req("https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token", body, NULL, buf, cap);
+    bool ok=false;
+    if(n>0 && g_http_status==200){ cJSON *r=cJSON_Parse(buf);
+        if(r){ cJSON *at=cJSON_GetObjectItem(r,"access_token"), *ex=cJSON_GetObjectItem(r,"expires_in");
+            if(cJSON_IsString(at)){ strncpy(g_token,at->valuestring,sizeof(g_token)-1); g_token[sizeof(g_token)-1]=0;
+                int e=cJSON_IsNumber(ex)?(int)ex->valuedouble:1800;
+                g_token_exp_us=esp_timer_get_time()+(int64_t)(e-60)*1000000LL; ok=true;
+                ESP_LOGI(TAG,"opensky token OK (exp %ds, tok %d chars)",e,(int)strlen(g_token)); }
+            cJSON_Delete(r); }
+    } else ESP_LOGW(TAG,"opensky token FAIL n=%d status=%d",n,g_http_status);
+    free(buf); return ok;
+}
 static void fetch_flights(void){
     double rk=g_range_km, dla=rk/111.0, dlo=rk/(111.0*cos(my_lat*M_PI/180.0));
     char url[240];
     snprintf(url,sizeof(url),"https://opensky-network.org/api/states/all?lamin=%.4f&lomin=%.4f&lamax=%.4f&lomax=%.4f",
              my_lat-dla,my_lon-dlo,my_lat+dla,my_lon+dlo);
     int cap=64*1024; char *b=heap_caps_malloc(cap,MALLOC_CAP_SPIRAM); if(!b)b=malloc(cap); if(!b)return;
+    if(g_token[0]==0 || esp_timer_get_time() > g_token_exp_us) opensky_token();
     g_http_status=0;
-    int n=http_get(url,b,cap,true);
+    int n=http_req(url, NULL, g_token[0]?g_token:NULL, b, cap);
     if(n>0 && g_http_status==200){ cJSON *r=cJSON_Parse(b);
         if(r){ cJSON *states=cJSON_GetObjectItem(r,"states");
             flight_t tmp[MAX_FLIGHTS]; int cnt=0;

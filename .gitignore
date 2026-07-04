@@ -5,3 +5,5 @@ sdkconfig.old
 dependencies.lock
 *.bak
 .claude/
+main/secrets.h
+secrets.h
