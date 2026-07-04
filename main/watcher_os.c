@@ -595,11 +595,12 @@ static int range_idx = 1;                 /* default 20km */
 static volatile double g_range_km = 20.0;
 static volatile bool g_refetch = false;
 #define MAX_FLIGHTS 24
-typedef struct { double lat, lon; float track; int alt; char cs[10]; } flight_t;
+typedef struct { double lat, lon; float track; int alt; int cat; char cs[10]; } flight_t;
 static lv_obj_t  *radar_status, *radar_sweep;
 static lv_point_t sweep_pts[2];
 static float      sweep_ang = 0.0f;
-static lv_obj_t  *blip_dot[MAX_FLIGHTS], *blip_lbl[MAX_FLIGHTS];
+static lv_obj_t  *blip_line[MAX_FLIGHTS], *blip_lbl[MAX_FLIGHTS];
+static lv_point_t arrow_pts[MAX_FLIGHTS][4];
 static flight_t   g_flights[MAX_FLIGHTS];
 static volatile int g_nfl = 0;
 static volatile bool g_radar_dirty = false;
@@ -710,6 +711,8 @@ static void fetch_flights(void){
                     tmp[cnt].lat=la->valuedouble; tmp[cnt].lon=lo->valuedouble;
                     tmp[cnt].track=cJSON_IsNumber(tr)?tr->valuedouble:0;
                     tmp[cnt].alt=cJSON_IsNumber(al)?(int)al->valuedouble:0;
+                    cJSON *ca=cJSON_GetArrayItem(st,17);
+                    tmp[cnt].cat=cJSON_IsNumber(ca)?(int)ca->valuedouble:-1;
                     tmp[cnt].cs[0]=0;
                     if(cJSON_IsString(cs)){ int j=0; for(char *p=cs->valuestring;*p&&j<9;p++) if(*p!=' ') tmp[cnt].cs[j++]=*p; tmp[cnt].cs[j]=0; }
                     cnt++; }
@@ -720,7 +723,8 @@ static void fetch_flights(void){
             xSemaphoreGive(fl_mux);
             g_last_ok_us = esp_timer_get_time();
             g_radar_dirty=true;
-            ESP_LOGI(TAG,"flights=%d (%.0fkm box)",cnt,g_range_km);
+            { int wc=0; for(int i=0;i<cnt;i++) if(g_flights[i].cat>0) wc++;
+              ESP_LOGI(TAG,"flights=%d (%.0fkm box)  categories_present=%d first_cat=%d",cnt,g_range_km,wc,cnt?g_flights[0].cat:-1); }
             cJSON_Delete(r);
         } else { ESP_LOGW(TAG,"flights: parse fail status=%d",g_http_status); g_radar_dirty=true; }
     } else { ESP_LOGW(TAG,"flights: http n=%d status=%d (rate-limited?)",n,g_http_status); g_radar_dirty=true; }
@@ -766,14 +770,14 @@ static void radar_build(lv_obj_t *tile){
     lv_obj_add_style(radar_sweep,&sst,0);
     sweep_pts[0].x=RADAR_CX; sweep_pts[0].y=RADAR_CY; sweep_pts[1].x=RADAR_CX; sweep_pts[1].y=RADAR_CY-RADAR_R;
     lv_line_set_points(radar_sweep,sweep_pts,2);
-    /* blip pool */
+    /* blip pool: heading arrows (lv_line triangles) + callsign labels */
+    static lv_style_t arrow_st; lv_style_init(&arrow_st);
+    lv_style_set_line_width(&arrow_st,2); lv_style_set_line_rounded(&arrow_st,true);
     for(int i=0;i<MAX_FLIGHTS;i++){
-        blip_dot[i]=lv_obj_create(tile); lv_obj_set_size(blip_dot[i],7,7);
-        lv_obj_set_style_radius(blip_dot[i],LV_RADIUS_CIRCLE,0);
-        lv_obj_set_style_bg_color(blip_dot[i],lv_color_hex(0xffee55),0);
-        lv_obj_set_style_border_width(blip_dot[i],0,0);
-        lv_obj_clear_flag(blip_dot[i],LV_OBJ_FLAG_CLICKABLE|LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_add_flag(blip_dot[i],LV_OBJ_FLAG_HIDDEN);
+        blip_line[i]=lv_line_create(tile);
+        lv_obj_add_style(blip_line[i],&arrow_st,0);
+        lv_obj_clear_flag(blip_line[i],LV_OBJ_FLAG_CLICKABLE|LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(blip_line[i],LV_OBJ_FLAG_HIDDEN);
         blip_lbl[i]=lv_label_create(tile);
         lv_obj_set_style_text_color(blip_lbl[i],lv_color_hex(0xcfeecf),0);
         lv_obj_set_style_text_font(blip_lbl[i],&lv_font_montserrat_16,0);
@@ -807,14 +811,22 @@ static void radar_tick(void){
             int rp=(int)((d/g_range_km)*RADAR_R);
             int x=RADAR_CX+(int)(rp*sin(br*M_PI/180.0));
             int y=RADAR_CY-(int)(rp*cos(br*M_PI/180.0));
-            lv_obj_set_style_bg_color(blip_dot[shown],bc,0);
-            lv_obj_set_pos(blip_dot[shown],x-3,y-3); lv_obj_clear_flag(blip_dot[shown],LV_OBJ_FLAG_HIDDEN);
+            double a=g_flights[i].track*M_PI/180.0;   /* heading, 0=N clockwise */
+            double fx=sin(a), fy=-cos(a);             /* forward unit (screen: up=north) */
+            int bx=x-(int)(fx*4), by=y-(int)(fy*4);   /* tail center */
+            arrow_pts[shown][0].x=x+(int)(fx*9);  arrow_pts[shown][0].y=y+(int)(fy*9);   /* nose */
+            arrow_pts[shown][1].x=bx+(int)(-fy*5); arrow_pts[shown][1].y=by+(int)(fx*5); /* wing L */
+            arrow_pts[shown][2].x=bx-(int)(-fy*5); arrow_pts[shown][2].y=by-(int)(fx*5); /* wing R */
+            arrow_pts[shown][3]=arrow_pts[shown][0];  /* close */
+            lv_line_set_points(blip_line[shown], arrow_pts[shown], 4);
+            lv_obj_set_style_line_color(blip_line[shown], bc, 0);
+            lv_obj_clear_flag(blip_line[shown],LV_OBJ_FLAG_HIDDEN);
             lv_label_set_text(blip_lbl[shown],g_flights[i].cs);
-            lv_obj_set_pos(blip_lbl[shown],x+5,y-8); lv_obj_clear_flag(blip_lbl[shown],LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_pos(blip_lbl[shown],x+7,y-8); lv_obj_clear_flag(blip_lbl[shown],LV_OBJ_FLAG_HIDDEN);
             shown++;
         }
         xSemaphoreGive(fl_mux);
-        for(int i=shown;i<MAX_FLIGHTS;i++){ lv_obj_add_flag(blip_dot[i],LV_OBJ_FLAG_HIDDEN); lv_obj_add_flag(blip_lbl[i],LV_OBJ_FLAG_HIDDEN); }
+        for(int i=shown;i<MAX_FLIGHTS;i++){ lv_obj_add_flag(blip_line[i],LV_OBJ_FLAG_HIDDEN); lv_obj_add_flag(blip_lbl[i],LV_OBJ_FLAG_HIDDEN); }
     }
     /* status refreshes every tick so the STALE age stays live */
     if(wifi_st==W_CONNECTED && g_located){
