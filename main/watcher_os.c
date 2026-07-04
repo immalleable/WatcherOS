@@ -57,6 +57,7 @@ static lv_obj_t *TILES[MAX_APPS];
 static int      n_apps = 0;
 static int      g_active = 0;
 static int      g_wifi_idx = -1;   /* tile index of the WiFi app */
+static int      g_timer_idx = -1;  /* tile index of the Timer app */
 static lv_obj_t *tileview = NULL;
 
 /* WiFi state — declared early because the Home app displays it */
@@ -791,6 +792,14 @@ static void ui_tick(lv_timer_t *t)
     if (long_cnt != seen_long)  { seen_long = long_cnt; lv_obj_set_tile(tileview, TILES[0], LV_ANIM_ON); }
     /* periodic UI for the active app */
     if (APPS[g_active].tick) APPS[g_active].tick();
+
+    /* timer alarm is global: fire even if you're on another screen */
+    if (t_state == T_RUN && esp_timer_get_time() >= t_end) {
+        t_state = T_DONE;
+        if (g_active != g_timer_idx && g_timer_idx >= 0)
+            lv_obj_set_tile(tileview, TILES[g_timer_idx], LV_ANIM_ON);   /* jump to TIME! screen */
+    }
+    led_flash = (t_state == T_DONE);   /* LED blinks whenever the timer is ringing */
 }
 
 static void ui_build(void)
@@ -833,7 +842,7 @@ void app_main(void)
 
     /* register apps (order = tile order) */
     app_register((app_t){ .name = "Radar", .build = radar_build, .tick = radar_tick, .on_knob = radar_on_knob });
-    app_register((app_t){ .name = "Timer", .build = timer_build, .tick = timer_tick,
+    g_timer_idx = app_register((app_t){ .name = "Timer", .build = timer_build, .tick = timer_tick,
                           .on_knob = timer_on_knob, .on_button = timer_on_button });
     g_wifi_idx = app_register((app_t){ .name = "WiFi", .build = wifi_build, .on_show = wifi_on_show, .tick = wifi_tick });
 
