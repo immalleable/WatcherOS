@@ -58,6 +58,9 @@ static int      n_apps = 0;
 static int      g_active = 0;
 static int      g_wifi_idx = -1;   /* tile index of the WiFi app */
 static int      g_timer_idx = -1;  /* tile index of the Timer app */
+static volatile int64_t g_last_interact_us = 0;
+static bool     g_screen_dim = false;
+#define IDLE_DIM_MS 60000
 static lv_obj_t *tileview = NULL;
 
 /* WiFi state — declared early because the Home app displays it */
@@ -87,6 +90,7 @@ static volatile uint32_t long_cnt = 0;
 static void knob_ev(int dir)
 {
     int64_t now = esp_timer_get_time();
+    g_last_interact_us = now;
     if (now - knob_last_ev <= KNOB_BURST_US) burst_n++;
     else burst_n = 1;
     knob_last_ev = now;
@@ -688,7 +692,7 @@ static void radar_task(void *arg){
     int64_t last=0;
     while(1){
         int64_t now=esp_timer_get_time();
-        if(wifi_st==W_CONNECTED && (g_refetch || last==0 || now-last>60000000LL)){ g_refetch=false; last=now; fetch_flights(); }
+        if(wifi_st==W_CONNECTED && !g_screen_dim && (g_refetch || last==0 || now-last>60000000LL)){ g_refetch=false; last=now; fetch_flights(); }
         vTaskDelay(pdMS_TO_TICKS(300));
     }
 }
@@ -816,6 +820,13 @@ static void ui_tick(lv_timer_t *t)
             lv_obj_set_tile(tileview, TILES[g_timer_idx], LV_ANIM_ON);   /* jump to TIME! screen */
     }
     led_flash = (t_state == T_DONE);   /* LED blinks whenever the timer is ringing */
+
+    /* power saving: backlight off after idle; touch/knob/button or a firing alarm wakes it */
+    int64_t nowd = esp_timer_get_time();
+    if (lv_disp_get_inactive_time(NULL) < 300) g_last_interact_us = nowd;   /* touch activity */
+    bool want_dim = (nowd - g_last_interact_us > (int64_t)IDLE_DIM_MS * 1000) && (t_state != T_DONE);
+    if (want_dim && !g_screen_dim)  { bsp_lcd_brightness_set(0);   g_screen_dim = true;  ESP_LOGI(TAG, "screen off (idle)"); }
+    else if (!want_dim && g_screen_dim) { bsp_lcd_brightness_set(100); g_screen_dim = false; ESP_LOGI(TAG, "screen on (wake)"); }
     if (t_state == T_DONE) {
         static int64_t last_beep = 0;
         int64_t nb = esp_timer_get_time();
@@ -881,6 +892,7 @@ void app_main(void)
     BaseType_t rc = xTaskCreate(radar_task, "radar", 8192, NULL, 4, NULL);
     ESP_LOGI(TAG, "radar task create rc=%d free_internal=%d", (int)rc, (int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 
+    g_last_interact_us = esp_timer_get_time();
     ESP_LOGI(TAG, "watcher_os running: %d apps (Home, Timer, WiFi). swipe to navigate.", n_apps);
     /* nothing else here — the LVGL task + fx_task + input drive everything */
     while (1) vTaskDelay(pdMS_TO_TICKS(5000));
