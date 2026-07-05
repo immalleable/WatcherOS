@@ -596,7 +596,7 @@ static volatile double g_range_km = 20.0;
 static volatile bool g_refetch = false;
 #define MAX_FLIGHTS 24
 typedef struct { double lat, lon; float track; int alt; int cat; char cs[10]; } flight_t;
-static lv_obj_t  *radar_status, *radar_sweep;
+static lv_obj_t  *radar_status, *radar_sweep, *radar_range;
 static lv_point_t sweep_pts[2];
 static float      sweep_ang = 0.0f;
 static lv_obj_t  *blip_line[MAX_FLIGHTS], *blip_lbl[MAX_FLIGHTS];
@@ -789,6 +789,13 @@ static void radar_build(lv_obj_t *tile){
     lv_obj_set_style_text_font(radar_status,&lv_font_montserrat_16,0);
     lv_obj_set_style_bg_color(radar_status,lv_color_black(),0); lv_obj_set_style_bg_opa(radar_status,LV_OPA_50,0);
     lv_obj_set_style_pad_all(radar_status,3,0); lv_obj_align(radar_status,LV_ALIGN_BOTTOM_MID,0,-6);
+    /* range readout on top, clear of the bottom status line */
+    radar_range=lv_label_create(tile);
+    lv_label_set_text(radar_range,"--km");
+    lv_obj_set_style_text_color(radar_range,lv_color_hex(0xffee55),0);
+    lv_obj_set_style_text_font(radar_range,&lv_font_montserrat_16,0);
+    lv_obj_set_style_bg_color(radar_range,lv_color_black(),0); lv_obj_set_style_bg_opa(radar_range,LV_OPA_50,0);
+    lv_obj_set_style_pad_all(radar_range,3,0); lv_obj_align(radar_range,LV_ALIGN_TOP_MID,0,8);
 }
 static void radar_tick(void){
     led_flash=false; led_r=0; led_g=18; led_b=6;
@@ -828,12 +835,14 @@ static void radar_tick(void){
         xSemaphoreGive(fl_mux);
         for(int i=shown;i<MAX_FLIGHTS;i++){ lv_obj_add_flag(blip_line[i],LV_OBJ_FLAG_HIDDEN); lv_obj_add_flag(blip_lbl[i],LV_OBJ_FLAG_HIDDEN); }
     }
+    /* range readout on top always reflects the current zoom (knob works pre-fix too) */
+    lv_label_set_text_fmt(radar_range,"%dkm  (turn=zoom)",(int)g_range_km);
     /* status refreshes every tick so the STALE age stays live */
     if(wifi_st==W_CONNECTED && g_located){
         char b[96];
-        if(g_last_ok_us==0) snprintf(b,sizeof(b),"%s  waiting for flights  %dkm", loc_city[0]?loc_city:"?", (int)g_range_km);
-        else if(stale)      snprintf(b,sizeof(b),"%s  STALE %ds  %dkm (turn=zoom)", loc_city[0]?loc_city:"?", (int)((now_t-g_last_ok_us)/1000000LL), (int)g_range_km);
-        else                snprintf(b,sizeof(b),"%s  %d fl  %dkm (turn=zoom)", loc_city[0]?loc_city:"?", g_nfl, (int)g_range_km);
+        if(g_last_ok_us==0) snprintf(b,sizeof(b),"%s  waiting for flights", loc_city[0]?loc_city:"?");
+        else if(stale)      snprintf(b,sizeof(b),"%s  STALE %ds", loc_city[0]?loc_city:"?", (int)((now_t-g_last_ok_us)/1000000LL));
+        else                snprintf(b,sizeof(b),"%s  %d fl", loc_city[0]?loc_city:"?", g_nfl);
         lv_label_set_text(radar_status,b);
     } else if(wifi_st!=W_CONNECTED){
         lv_label_set_text(radar_status, wifi_st==W_CONNECTING?"RADAR  connecting wifi...":"RADAR  no wifi (swipe to set up)");
