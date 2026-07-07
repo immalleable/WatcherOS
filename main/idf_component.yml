@@ -2,5 +2,11 @@
 dependencies:
   idf: ">=5.0"
 
+  espressif/quirc: "^1.2.0"
+
+  esp_jpeg_simd:
+    override_path: "/home/im/lab/SenseCAP-Watcher-Firmware/components/esp_jpeg_simd"
+
+
   sensecap-watcher:
     override_path: "/home/im/lab/SenseCAP-Watcher-Firmware/components/sensecap-watcher"

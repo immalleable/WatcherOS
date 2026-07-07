@@ -39,6 +39,13 @@
 #include "esp_crt_bundle.h"
 #include "cJSON.h"
 #include "secrets.h"
+#include "sscma_client.h"
+#include "sscma_client_ops.h"
+#include "sscma_client_types.h"
+#include "esp_jpeg_dec.h"
+#include "quirc.h"
+#include "isp.h"
+#include "mbedtls/base64.h"
 
 static const char *TAG = "WATCHER_OS";
 
@@ -439,6 +446,159 @@ static void wifi_init(void)
 }
 
 /* ================= WiFi settings app ================= */
+/* ================= WiFi QR scan (Himax camera -> quirc) =================
+ * The camera is OFF by default (keeps WiFi/RAM happy); it is lazily brought up
+ * on the first QR press and driven by qr_task so the blocking sscma init never
+ * stalls the LVGL task. Frames arrive on the sscma client's own thread: we
+ * JPEG-decode -> grayscale -> quirc there, and hand a decoded WiFi QR back to
+ * the UI thread (wifi_tick) via qr_hit, which calls the normal wifi_connect(). */
+#define QR_IMG_W 416
+#define QR_IMG_H 416
+#define QR_JPEG_MAX (48*1024)
+static sscma_client_handle_t qr_client = NULL;
+static struct quirc *qr_q = NULL;
+static lv_img_dsc_t qr_img;                 /* decoded RGB565 frame (PSRAM) = live preview */
+static uint8_t *qr_jpeg = NULL;             /* base64-decoded JPEG (PSRAM) */
+static volatile bool qr_want = false;       /* user asked to scan */
+static volatile bool qr_cam_on = false;     /* camera currently invoking */
+static volatile bool qr_hit = false;        /* a WiFi QR decoded -> UI picks up */
+static volatile bool qr_frame = false;      /* fresh preview frame ready */
+static char qr_ssid[33], qr_pass[65], qr_last[160];
+static lv_obj_t *w_qrview = NULL, *w_qrhint = NULL;
+
+static void qr_unescape(const char *src, int len, char *dst, int cap)
+{
+    int j = 0;
+    for (int i = 0; i < len && j < cap - 1; i++) {
+        if (src[i] == '\\' && i + 1 < len) dst[j++] = src[++i];
+        else dst[j++] = src[i];
+    }
+    dst[j] = 0;
+}
+static bool parse_wifi_qr(const char *s, char *ssid, int scap, char *pass, int pcap)
+{
+    if (strncmp(s, "WIFI:", 5) != 0) return false;
+    ssid[0] = 0; pass[0] = 0;
+    const char *p = s + 5;
+    while (*p && *p != ';') {
+        char key = p[0];
+        if (p[1] != ':') break;
+        const char *v = p + 2, *e = v;
+        while (*e) { if (*e == '\\' && e[1]) { e += 2; continue; } if (*e == ';') break; e++; }
+        if (key == 'S') qr_unescape(v, e - v, ssid, scap);
+        else if (key == 'P') qr_unescape(v, e - v, pass, pcap);
+        p = (*e == ';') ? e + 1 : e;
+    }
+    return ssid[0] != 0;
+}
+static int qr_decode_jpeg(uint8_t *in, int len, uint8_t *out)
+{
+    jpeg_dec_config_t cfg = { .output_type = JPEG_RAW_TYPE_RGB565_BE, .rotate = JPEG_ROTATE_0D };
+    jpeg_dec_handle_t dec = jpeg_dec_open(&cfg);
+    if (!dec) return -1;
+    jpeg_dec_io_t *io = calloc(1, sizeof(jpeg_dec_io_t));
+    jpeg_dec_header_info_t *hdr = calloc(1, sizeof(jpeg_dec_header_info_t));
+    int ret = -1;
+    if (!io || !hdr) goto done;
+    io->inbuf = in; io->inbuf_len = len;
+    if (jpeg_dec_parse_header(dec, io, hdr) < 0) goto done;
+    io->outbuf = out;
+    { int consumed = io->inbuf_len - io->inbuf_remain; io->inbuf = in + consumed; io->inbuf_len = io->inbuf_remain; }
+    ret = jpeg_dec_process(dec, io);
+done:
+    jpeg_dec_close(dec); free(hdr); free(io);
+    return ret;
+}
+static void qr_scan(void)
+{
+    int w, h;
+    uint8_t *buf = quirc_begin(qr_q, &w, &h);
+    rgb565_to_gray(buf, (const uint8_t *)qr_img.data, QR_IMG_H, QR_IMG_W, h, w, ROTATION_UP, true);
+    quirc_end(qr_q);
+    int count = quirc_count(qr_q);
+    for (int i = 0; i < count; i++) {
+        struct quirc_code code; struct quirc_data data;
+        quirc_extract(qr_q, i, &code);
+        if (quirc_decode(&code, &data) != 0) continue;
+        const char *payload = (const char *)data.payload;
+        if (strcmp(payload, qr_last) == 0) return;
+        strncpy(qr_last, payload, sizeof(qr_last) - 1);
+        ESP_LOGI(TAG, "QR: %s", payload);
+        char ss[33], pw[65];
+        if (parse_wifi_qr(payload, ss, sizeof(ss), pw, sizeof(pw))) {
+            strncpy(qr_ssid, ss, sizeof(qr_ssid) - 1);
+            strncpy(qr_pass, pw, sizeof(qr_pass) - 1);
+            qr_hit = true;   /* UI thread connects + tears the camera down */
+        }
+        return;
+    }
+}
+static void qr_on_event(sscma_client_handle_t c, const sscma_client_reply_t *reply, void *ctx)
+{
+    char *img = NULL; int img_size = 0;
+    if (sscma_utils_fetch_image_from_reply(reply, &img, &img_size) != ESP_OK) return;
+    if (qr_want && !qr_hit && qr_img.data && qr_jpeg) {
+        size_t out_len = 0;
+        if (mbedtls_base64_decode(qr_jpeg, QR_JPEG_MAX, &out_len, (const unsigned char *)img, strlen(img)) == 0) {
+            if (qr_decode_jpeg(qr_jpeg, out_len, (uint8_t *)qr_img.data) >= 0) {
+                qr_frame = true;   /* preview refresh for the UI */
+                qr_scan();
+            }
+        }
+    }
+    free(img);
+}
+static bool qr_alloc(void)
+{
+    if (!qr_img.data) {
+        qr_img.data = heap_caps_aligned_alloc(16, QR_IMG_W * QR_IMG_H * 2, MALLOC_CAP_SPIRAM);
+        qr_img.header.cf = LV_IMG_CF_TRUE_COLOR;
+        qr_img.header.w = QR_IMG_W; qr_img.header.h = QR_IMG_H;
+        qr_img.data_size = QR_IMG_W * QR_IMG_H * 2;
+    }
+    if (!qr_jpeg) qr_jpeg = heap_caps_malloc(QR_JPEG_MAX, MALLOC_CAP_SPIRAM);
+    if (!qr_q) { qr_q = quirc_new(); if (qr_q) quirc_resize(qr_q, QR_IMG_W, QR_IMG_H); }
+    return qr_img.data && qr_jpeg && qr_q;
+}
+static void qr_himax_init(void)
+{
+    qr_client = bsp_sscma_client_init();
+    if (!qr_client) { ESP_LOGE(TAG, "sscma init failed"); return; }
+    const sscma_client_callback_t cb = { .on_event = qr_on_event };
+    sscma_client_register_callback(qr_client, &cb, NULL);
+    sscma_client_init(qr_client);
+    sscma_client_set_model(qr_client, 1);
+    sscma_client_set_sensor(qr_client, 1, 1, true);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    sscma_client_break(qr_client);   /* stay idle until a scan starts */
+    ESP_LOGI(TAG, "sscma camera ready");
+}
+static void qr_cam_start(void)
+{
+    if (qr_cam_on || !qr_client) return;
+    if (sscma_client_invoke(qr_client, -1, false, true) == ESP_OK) qr_cam_on = true;
+    else ESP_LOGW(TAG, "cam invoke failed");
+}
+static void qr_cam_stop(void)
+{
+    if (!qr_cam_on) return;
+    sscma_client_break(qr_client);
+    qr_cam_on = false;
+}
+static void qr_task(void *arg)
+{
+    bool inited = false;
+    for (;;) {
+        if (qr_want) {
+            if (!inited) { if (qr_alloc()) { qr_himax_init(); inited = (qr_client != NULL); } }
+            if (inited) qr_cam_start();
+        } else if (qr_cam_on) {
+            qr_cam_stop();
+        }
+        vTaskDelay(pdMS_TO_TICKS(120));
+    }
+}
+
 static lv_obj_t *w_status, *w_list, *w_pwbox, *w_ta, *w_kb, *w_ssid_lbl, *w_note;
 static char      w_sel_ssid[33] = "";
 static int       w_last_shown_scan = -1;
@@ -479,8 +639,20 @@ static void wifi_ok_cb(lv_event_t *e)     /* connect with typed password */
     wifi_connect(w_sel_ssid, pw);
     wifi_show_password(false);
 }
-static void wifi_cancel_cb(lv_event_t *e) { wifi_show_password(false); }   /* back to list */
-static void wifi_qr_cb(lv_event_t *e)     { lv_label_set_text(w_note, LV_SYMBOL_IMAGE "  QR scan: coming next"); }
+static void wifi_stop_qr(void)
+{
+    qr_want = false;
+    if (w_qrview) lv_obj_add_flag(w_qrview, LV_OBJ_FLAG_HIDDEN);
+    if (w_qrhint) lv_obj_add_flag(w_qrhint, LV_OBJ_FLAG_HIDDEN);
+}
+static void wifi_cancel_cb(lv_event_t *e) { wifi_stop_qr(); wifi_show_password(false); }   /* back to list */
+static void wifi_qr_cb(lv_event_t *e)     /* start camera QR scan */
+{
+    qr_last[0] = 0; qr_hit = false; qr_frame = false; qr_want = true;
+    if (w_qrview) { lv_obj_clear_flag(w_qrview, LV_OBJ_FLAG_HIDDEN); lv_obj_move_foreground(w_qrview); }
+    if (w_qrhint) { lv_label_set_text(w_qrhint, LV_SYMBOL_IMAGE "  Point at a WiFi QR   (Cancel to stop)");
+                    lv_obj_clear_flag(w_qrhint, LV_OBJ_FLAG_HIDDEN); lv_obj_move_foreground(w_qrhint); }
+}
 static void wifi_build(lv_obj_t *tile)
 {
     lv_obj_set_style_bg_color(tile, lv_color_hex(0x0a0a12), 0);
@@ -547,6 +719,19 @@ static void wifi_build(lv_obj_t *tile)
     lv_obj_add_event_cb(w_kb, wifi_kb_cb, LV_EVENT_READY, NULL);
     lv_obj_add_event_cb(w_kb, wifi_kb_cb, LV_EVENT_CANCEL, NULL);
     lv_obj_add_flag(w_pwbox, LV_OBJ_FLAG_HIDDEN);
+
+    /* camera QR overlay (full-screen, on top of everything; hidden until scanning) */
+    w_qrview = lv_img_create(tile);
+    lv_obj_center(w_qrview);
+    lv_obj_add_flag(w_qrview, LV_OBJ_FLAG_HIDDEN);
+    w_qrhint = lv_label_create(tile);
+    lv_label_set_text(w_qrhint, "");
+    lv_obj_set_style_text_color(w_qrhint, lv_color_hex(0x39d0ff), 0);
+    lv_obj_set_style_text_font(w_qrhint, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_bg_color(w_qrhint, lv_color_black(), 0); lv_obj_set_style_bg_opa(w_qrhint, LV_OPA_50, 0);
+    lv_obj_set_style_pad_all(w_qrhint, 4, 0);
+    lv_obj_align(w_qrhint, LV_ALIGN_BOTTOM_MID, 0, -18);
+    lv_obj_add_flag(w_qrhint, LV_OBJ_FLAG_HIDDEN);
 }
 static void wifi_on_show(void)
 {
@@ -569,6 +754,16 @@ static void wifi_tick(void)
         }
     } else if (wifi_st == W_IDLE) {
         lv_label_set_text(w_status, scan_busy ? "scanning..." : "tap a network");
+    }
+
+    /* QR scan: refresh the live preview and act on a decoded WiFi QR */
+    if (qr_want && qr_frame && w_qrview) { qr_frame = false; lv_img_set_src(w_qrview, &qr_img); lv_obj_invalidate(w_qrview); }
+    if (qr_hit) {
+        qr_hit = false; wifi_stop_qr();
+        wifi_show_password(false);
+        wifi_save(qr_ssid, qr_pass);
+        wifi_connect(qr_ssid, qr_pass);
+        lv_label_set_text_fmt(w_status, "QR " LV_SYMBOL_OK " connecting %s...", qr_ssid);
     }
 
     /* populate list when a scan completes */
@@ -954,6 +1149,7 @@ void app_main(void)
     wifi_init();
     input_init();
     BaseType_t rc = xTaskCreate(radar_task, "radar", 8192, NULL, 4, NULL);
+    xTaskCreate(qr_task, "qr", 6144, NULL, 3, NULL);
     ESP_LOGI(TAG, "radar task create rc=%d free_internal=%d", (int)rc, (int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 
     g_last_interact_us = esp_timer_get_time();
