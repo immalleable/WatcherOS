@@ -7,3 +7,8 @@ dependencies.lock
 .claude/
 main/secrets.h
 secrets.h
+
+# simulator build artifacts (keep sim/*.c, lv_conf.h, *.sh, *.py and docs/*.png)
+sim/sim
+sim/*.565
+sim/out_*
