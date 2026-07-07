@@ -347,6 +347,7 @@ static int8_t        scan_rssi[MAX_SCAN];
 static volatile int  scan_count = 0;
 static volatile bool scan_ready = false;
 static volatile bool scan_busy = false;
+static volatile int  scan_gen = 0;   /* bumps every completed scan so the list refreshes even when the count is unchanged */
 
 static void wifi_save(const char *ssid, const char *pass)
 {
@@ -405,7 +406,7 @@ static void wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data)
             }
             scan_count = out; free(recs);
         } else scan_count = 0;
-        scan_busy = false; scan_ready = true;
+        scan_busy = false; scan_ready = true; scan_gen++;
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         wifi_event_sta_disconnected_t *d = (wifi_event_sta_disconnected_t *)data;
         ESP_LOGW(TAG, "disconnected, reason=%d, retry=%d", d ? d->reason : -1, wifi_retry);
@@ -735,7 +736,7 @@ static void wifi_build(lv_obj_t *tile)
 }
 static void wifi_on_show(void)
 {
-    if (wifi_st != W_CONNECTED) wifi_scan_start();
+    wifi_scan_start();   /* always rescan so you can switch networks even while connected */
 }
 static void wifi_tick(void)
 {
@@ -767,14 +768,15 @@ static void wifi_tick(void)
     }
 
     /* populate list when a scan completes */
-    if (scan_ready && scan_count != w_last_shown_scan) {
-        w_last_shown_scan = scan_count;
+    if (scan_ready && scan_gen != w_last_shown_scan) {
+        w_last_shown_scan = scan_gen;
         scan_ready = false;
         lv_obj_clean(w_list);
         for (int i = 0; i < scan_count; i++) {
-            lv_obj_t *b = lv_list_add_btn(w_list, LV_SYMBOL_WIFI, scan_ssid[i]);
-            lv_obj_set_style_bg_color(b, lv_color_hex(0x1c1c28), 0);
-            lv_obj_set_style_text_color(b, lv_color_white(), 0);
+            bool cur = (wifi_st == W_CONNECTED) && (strcmp(scan_ssid[i], wifi_ssid) == 0);
+            lv_obj_t *b = lv_list_add_btn(w_list, cur ? LV_SYMBOL_OK : LV_SYMBOL_WIFI, scan_ssid[i]);
+            lv_obj_set_style_bg_color(b, lv_color_hex(cur ? 0x14321c : 0x1c1c28), 0);
+            lv_obj_set_style_text_color(b, cur ? lv_color_hex(0x8ce63a) : lv_color_white(), 0);
             lv_obj_add_event_cb(b, wifi_ap_click_cb, LV_EVENT_CLICKED, NULL);
         }
         if (scan_count == 0) lv_list_add_text(w_list, "no networks - swipe away & back to rescan");
